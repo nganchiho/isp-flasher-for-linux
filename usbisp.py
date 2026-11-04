@@ -8,7 +8,7 @@ The protocol was taken from ProgISP 1.72's HID traffic. Every transfer is a HID 
 
 Run without arguments for the GUI, or see --help for the CLI.
 """
-import argparse, glob, json, os, shutil, subprocess, sys, threading, time, queue
+import argparse, json, os, sys, threading, time, queue
 
 try:
     import hid
@@ -88,6 +88,14 @@ class UsbIsp:
         for w, v in zip(chip['fuse_w'], values):
             self.spi_word(w, v, chip['fuse_wpos'])
             time.sleep(chip['wd_fuse'] / 1000)
+
+    def lock(self, chip):
+        return self.spi_word(chip['lock_r'])[3]
+
+    def write_lock(self, chip, value):
+        # ATmega103/161 take the lock value in byte 1 (their XML LockWPos=1); everything else in byte 3
+        self.spi_word(chip['lock_w'], value, 1 if chip['lock_w'] == 0xAC000000 else 3)
+        time.sleep(0.009)  # WD_LOCK is 9 ms for every AVR in ProgISP's XMLs
 
 
 # ---------- Intel HEX ----------
@@ -172,7 +180,7 @@ def op_detect(chip, log, prog, **_):
         return c['name']
 
 
-def op_write(chip, log, prog, flash, eeprom=None, **_):
+def op_write(chip, log, prog, flash, eeprom=None, lock=None, **_):
     with Session(chip, log) as (isp, c):
         img = load_image(flash, c['flash'])
         unit = max(BLOCK, c['page'])  # never skip half a page: the stick commits at page end
@@ -188,16 +196,67 @@ def op_write(chip, log, prog, flash, eeprom=None, **_):
                 isp.write_flash(b, bytes(img[b:b + BLOCK]), c['page'])
             prog(i + 1, total)
         log('verifying…')
-        for i, a in enumerate(units):
-            for b in range(a, a + unit, BLOCK):
-                got = isp.read_flash(b)
-                if got != img[b:b + BLOCK]:
-                    off = next(k for k in range(BLOCK) if got[k] != img[b + k])
-                    raise IspError(f'verify failed at 0x{b + off:X}: read {got[off]:02X}, expected {img[b + off]:02X}')
-            prog(len(units) + i + 1, total)
+        verify_flash(isp, img, units, unit, lambda i, n: prog(len(units) + i, total))
         log('flash OK')
         if eeprom:
             write_eeprom(isp, c, eeprom, log, prog)
+        if lock is not None:
+            set_lock(isp, c, lock, log)
+
+
+def verify_flash(isp, img, units, unit, prog):
+    for i, a in enumerate(units):
+        for b in range(a, a + unit, BLOCK):
+            got = isp.read_flash(b)
+            if got != img[b:b + BLOCK]:
+                off = next(k for k in range(BLOCK) if got[k] != img[b + k])
+                raise IspError(f'verify failed at 0x{b + off:X}: read {got[off]:02X}, expected {img[b + off]:02X}')
+        prog(i + 1, len(units))
+
+
+def op_verify(chip, log, prog, flash, eeprom=None, **_):
+    """Compare the chip against files without writing. Unused flash (0xFF in the file) is skipped."""
+    with Session(chip, log) as (isp, c):
+        img = load_image(flash, c['flash'])
+        units = [a for a in range(0, c['flash'], BLOCK) if img[a:a + BLOCK].strip(b'\xff')]
+        verify_flash(isp, img, units, BLOCK, prog)
+        log('flash matches ' + os.path.basename(flash))
+        if eeprom:
+            img = load_image(eeprom, c['eeprom'])
+            got = read_eeprom(isp, c, prog)
+            if got != img:
+                a = next(k for k in range(len(img)) if got[k] != img[k])
+                raise IspError(f'EEPROM differs at 0x{a:X}: read {got[a]:02X}, expected {img[a]:02X}')
+            log('EEPROM matches ' + os.path.basename(eeprom))
+
+
+def op_blank(chip, log, prog, **_):
+    with Session(chip, log) as (isp, c):
+        for a in range(0, c['flash'], BLOCK):
+            got = isp.read_flash(a)
+            if got.strip(b'\xff'):
+                off = next(k for k in range(BLOCK) if got[k] != 0xFF)
+                raise IspError(f'not blank: 0x{a + off:X} = {got[off]:02X}')
+            prog(a + BLOCK, c['flash'])
+        log('flash is blank')
+
+
+def set_lock(isp, c, value, log):
+    isp.write_lock(c, value)
+    got = isp.lock(c)
+    # ponytail: lock bits are bits 0-5 on every chip here; unused bits 6-7 read back as 1 on some, so ignore them
+    if (got ^ value) & 0x3F:
+        raise IspError(f'lock verify failed: wrote 0x{value:02X}, read 0x{got:02X} (erase the chip to clear lock bits)')
+    log(f'lock bits = 0x{got:02X}')
+
+
+def op_lock(chip, log, prog, value=None, **_):
+    with Session(chip, log) as (isp, c):
+        if value is not None:
+            set_lock(isp, c, value, log)
+        v = isp.lock(c)
+        log(f'lock: 0x{v:02X}')
+        return v
 
 
 def op_read(chip, log, prog, flash, **_):
@@ -250,45 +309,6 @@ def op_eeprom_read(chip, log, prog, eeprom, **_):
         log(f'saved {c["eeprom"]} EEPROM bytes to {eeprom}')
 
 
-def find_pio():
-    for p in (shutil.which('pio'), shutil.which('platformio'),
-              os.path.expanduser('~/.platformio/penv/bin/pio')):
-        if p and os.access(p, os.X_OK):
-            return p
-    raise IspError('PlatformIO not found (install it, or the VS Code PlatformIO extension)')
-
-
-def op_build(chip, log, prog, project, **_):
-    """Run `pio run` in a PlatformIO project and return the newest firmware.hex it produced."""
-    project = os.path.abspath(project)
-    if not os.path.isfile(os.path.join(project, 'platformio.ini')):
-        raise IspError(f'{project} has no platformio.ini')
-    log(f'building {project}…')
-    p = subprocess.Popen([find_pio(), 'run', '-d', project], stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT, text=True)
-    tail = []
-    for line in p.stdout:
-        line = line.rstrip()
-        tail = (tail + [line])[-15:]
-        if line.startswith(('Building ', 'Linking ', 'RAM:', 'Flash:')) or 'error' in line.lower():
-            log(line)
-    if p.wait():
-        log('\n'.join(tail))
-        raise IspError('build failed')
-    hexes = glob.glob(os.path.join(project, '.pio', 'build', '*', 'firmware.hex'))
-    if not hexes:
-        raise IspError('build succeeded but no firmware.hex was produced')
-    hx = max(hexes, key=os.path.getmtime)
-    log(f'built {hx}')
-    return hx
-
-
-def op_build_write(chip, log, prog, project, **_):
-    hx = op_build(chip, log, prog, project)
-    op_write(chip, log, prog, hx)
-    return hx
-
-
 FUSE_NAMES = ['low', 'high', 'ext']
 
 
@@ -319,13 +339,13 @@ def gui(initial_hex=None):
 
     root = tk.Tk()
     root.title('USB ISP Flasher')
-    root.minsize(640, 440)
+    root.minsize(560, 420)
     AUTO = 'Auto-detect'
     chip = tk.StringVar(value=saved.get('chip', AUTO))
     flash = tk.StringVar(value=initial_hex or saved.get('flash', ''))
-    project = tk.StringVar(value=saved.get('project', ''))
     eeprom = tk.StringVar(value=saved.get('eeprom', ''))
     fuse_vars = [tk.StringVar() for _ in FUSE_NAMES]
+    lock_var = tk.StringVar()
     events = queue.Queue()
     buttons = []
 
@@ -354,8 +374,7 @@ def gui(initial_hex=None):
         for b in buttons:
             b.state(['disabled'])
         bar['value'] = 0
-        json.dump({'chip': chip.get(), 'flash': flash.get(), 'eeprom': eeprom.get(), 'project': project.get()},
-                  open(SETTINGS, 'w'))
+        json.dump({'chip': chip.get(), 'flash': flash.get(), 'eeprom': eeprom.get()}, open(SETTINGS, 'w'))
 
         def work():
             try:
@@ -384,20 +403,6 @@ def gui(initial_hex=None):
     def detect():
         run(op_detect)
 
-    def need_project():
-        if not os.path.isfile(os.path.join(project.get(), 'platformio.ini')):
-            messagebox.showerror('USB ISP Flasher', 'Choose a PlatformIO project folder (one with platformio.ini).')
-            return False
-        return True
-
-    def build():
-        if need_project():
-            run(op_build, project=project.get())
-
-    def build_write():
-        if need_project():
-            run(op_build_write, project=project.get())
-
     def write():
         if need(flash, 'flash'):
             run(op_write, flash=flash.get())
@@ -418,6 +423,26 @@ def gui(initial_hex=None):
         if save_as(eeprom, 'Save EEPROM as'):
             run(op_eeprom_read, eeprom=eeprom.get())
 
+    def verify():
+        if need(flash, 'flash'):
+            run(op_verify, flash=flash.get())
+
+    def blank():
+        run(op_blank)
+
+    def lock_read():
+        run(op_lock)
+
+    def lock_write():
+        try:
+            v = int(lock_var.get(), 16)
+            assert 0 <= v <= 0xFF
+        except (ValueError, AssertionError):
+            return messagebox.showerror('Lock bits', 'Lock value must be one hex byte, e.g. 3C')
+        if messagebox.askyesno('Write lock bits', f'Write lock = 0x{v:02X}?\n\nLock bits can only be cleared by '
+                               'erasing the whole chip, and some modes block reading the flash back.', icon='warning'):
+            run(op_lock, value=v)
+
     def fuse_read():
         run(op_fuses)
 
@@ -436,28 +461,29 @@ def gui(initial_hex=None):
     b = ttk.Button(frm, text='Detect', command=detect)
     b.grid(row=0, column=3, padx=2)
     buttons.append(b)
-    ttk.Label(frm, text='Project').grid(row=1, column=0, sticky='w', pady=3)
-    ttk.Entry(frm, textvariable=project).grid(row=1, column=1, sticky='ew', padx=4)
-    ttk.Button(frm, text='Browse…', command=lambda: project.set(
-        filedialog.askdirectory(title='PlatformIO project folder') or project.get())).grid(row=1, column=2)
-    for i, (text, cmd) in enumerate((('Build', build), ('Build & Write', build_write))):
-        b = ttk.Button(frm, text=text, command=cmd)
-        b.grid(row=1, column=3 + i, padx=2)
-        buttons.append(b)
-    row(2, 'Flash', flash, [('Intel HEX', '*.hex'), ('Binary', '*.bin'), ('All', '*')],
-        [('Write', write), ('Read…', read)])
-    row(3, 'EEPROM', eeprom, [('Intel HEX', '*.eep *.hex'), ('All', '*')],
+    row(1, 'Flash', flash, [('Intel HEX', '*.hex'), ('Binary', '*.bin'), ('All', '*')],
+        [('Write', write), ('Verify', verify), ('Read…', read)])
+    row(2, 'EEPROM', eeprom, [('Intel HEX', '*.eep *.hex'), ('All', '*')],
         [('Write', ee_write), ('Read…', ee_read)])
 
     ff = ttk.Frame(frm)
-    ff.grid(row=4, column=0, columnspan=6, sticky='w', pady=6)
+    ff.grid(row=3, column=0, columnspan=6, sticky='w', pady=6)
     ttk.Label(ff, text='Fuses').pack(side='left')
     for n, v in zip(FUSE_NAMES, fuse_vars):
         ttk.Label(ff, text=f'  {n} 0x').pack(side='left')
         ttk.Entry(ff, textvariable=v, width=4).pack(side='left')
-    for text, cmd in (('Read', fuse_read), ('Write…', fuse_write), ('Erase chip…', erase)):
+    for text, cmd in (('Read', fuse_read), ('Write…', fuse_write)):
         b = ttk.Button(ff, text=text, command=cmd)
         b.pack(side='left', padx=(8 if text == 'Read' else 2, 2))
+        buttons.append(b)
+
+    lf = ttk.Frame(frm)
+    lf.grid(row=4, column=0, columnspan=6, sticky='w', pady=(0, 6))
+    ttk.Label(lf, text='Lock   0x').pack(side='left')
+    ttk.Entry(lf, textvariable=lock_var, width=4).pack(side='left')
+    for text, cmd in (('Read', lock_read), ('Write…', lock_write), ('Blank check', blank), ('Erase chip…', erase)):
+        b = ttk.Button(lf, text=text, command=cmd)
+        b.pack(side='left', padx=(8 if text in ('Read', 'Blank check') else 2, 2))
         buttons.append(b)
 
     bar = ttk.Progressbar(frm, maximum=100)
@@ -482,11 +508,11 @@ def gui(initial_hex=None):
             elif kind == 'done':
                 for b in buttons:
                     b.state(['!disabled'])
-                if val and val[0] in (op_build, op_build_write):
-                    flash.set(val[1])
                 if val and val[0] is op_fuses:
                     for var, f in zip(fuse_vars, val[1] + [None] * 3):
                         var.set('' if f is None else f'{f:02X}')
+                if val and val[0] is op_lock:
+                    lock_var.set(f'{val[1]:02X}')
         root.after(50, pump)
 
     log(f'{len(CHIPS)} chips loaded. Plug in the stick and a board, then Detect or Write.')
@@ -495,6 +521,13 @@ def gui(initial_hex=None):
 
 
 # ---------- CLI ----------
+
+def hexbyte(v):
+    n = int(v, 16)
+    if not 0 <= n <= 0xFF:
+        raise argparse.ArgumentTypeError(f'{v} is not a byte')
+    return n
+
 
 def main():
     if len(sys.argv) == 1 or (len(sys.argv) == 2 and os.path.isfile(sys.argv[1])):
@@ -507,11 +540,17 @@ def main():
     s = sub.add_parser('write', help='erase, write and verify flash')
     s.add_argument('flash')
     s.add_argument('--eeprom')
+    s.add_argument('--lock', type=hexbyte, help='write lock bits last, e.g. 3C')
+    s = sub.add_parser('verify', help='compare chip with files, no writing')
+    s.add_argument('flash')
+    s.add_argument('--eeprom')
+    sub.add_parser('blank', help='check flash is erased')
+    sub.add_parser('lock', help='read lock bits, or write them: lock 3C').add_argument('value', nargs='?', type=hexbyte)
     sub.add_parser('read').add_argument('flash', help='output .hex')
     sub.add_parser('eeprom-read').add_argument('eeprom', help='output .hex')
     sub.add_parser('eeprom-write').add_argument('eeprom')
     s = sub.add_parser('fuses', help='read fuses, or write them: fuses 0xFF 0xD9 0xFF (low high ext)')
-    s.add_argument('values', nargs='*', type=lambda v: int(v, 16))
+    s.add_argument('values', nargs='*', type=hexbyte)
     s = sub.add_parser('chips', help='list supported chips')
     a = p.parse_args()
 
@@ -526,7 +565,8 @@ def main():
             print(file=sys.stderr)
 
     fn = {'detect': op_detect, 'erase': op_erase, 'write': op_write, 'read': op_read,
-          'eeprom-read': op_eeprom_read, 'eeprom-write': op_eeprom_write, 'fuses': op_fuses}[a.cmd]
+          'eeprom-read': op_eeprom_read, 'eeprom-write': op_eeprom_write, 'fuses': op_fuses,
+          'verify': op_verify, 'blank': op_blank, 'lock': op_lock}[a.cmd]
     try:
         fn(a.chip, print, prog, **{k: v for k, v in vars(a).items() if k not in ('chip', 'cmd')})
     except IspError as e:
