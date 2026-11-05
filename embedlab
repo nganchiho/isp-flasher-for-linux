@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# embedlab — one menu for the embedded bench:
+#   AVR ISP flasher (usbisp), logic analyzer (PulseView / sigrok), CAN bus (SavvyCAN / SocketCAN),
+#   serial console (tio). Linux and macOS. Works with the stock macOS bash 3.2.
+set -uo pipefail
+
+OS=$(uname -s)   # Linux | Darwin
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+B=$'\e[1m'; D=$'\e[2m'; R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; C=$'\e[36m'; N=$'\e[0m'
+info() { printf '%s\n' "${C}::${N} $*"; }
+ok()   { printf '%s\n' "${G}✓${N} $*"; }
+warn() { printf '%s\n' "${Y}!${N} $*"; }
+err()  { printf '%s\n' "${R}✗${N} $*"; }
+have() { type -P "$1" >/dev/null 2>&1; }   # executables only, not our own functions
+
+ask() { # ask "prompt" default -> echoes answer
+  local a; read -rp "$1 ${D}[$2]${N}: " a || exit 0; printf '%s' "${a:-$2}"
+}
+yesno() { # yesno "prompt" y|n
+  local a hint="y/N"; [ "$2" = y ] && hint="Y/n"
+  read -rp "$1 ${D}[$hint]${N}: " a || exit 0
+  case "${a:-$2}" in y*|Y*) return 0 ;; *) return 1 ;; esac
+}
+pick() { # pick "title" item... -> sets PICK and PICK_N; returns 1 on q
+  local title=$1; shift
+  echo "${B}$title${N}"
+  local i=1 it; for it in "$@"; do printf '  %s) %s\n' "$i" "$it"; i=$((i + 1)); done
+  local n j
+  while :; do
+    read -rp "> " n || exit 0
+    if [[ $n =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )); then PICK=${!n}; PICK_N=$n; return 0; fi
+    [ "$n" = q ] && return 1
+    j=1; for it in "$@"; do   # also accept the value itself, e.g. "115200"
+      [ "$n" = "$it" ] && { PICK=$it; PICK_N=$j; return 0; }; j=$((j + 1))
+    done
+    warn "Pick 1-$# (q to go back)"
+  done
+}
+
+# Start a GUI app detached from this terminal.
+launch() { # launch <linux-cmd> <mac-app-name> [args...]
+  local cmd=$1 app=$2; shift 2
+  if [ "$OS" = Darwin ] && [ -d "/Applications/$app.app" ]; then
+    open -a "$app" --args "$@"
+  elif have "$cmd"; then
+    if have setsid; then setsid -f "$cmd" "$@" >/dev/null 2>&1; else nohup "$cmd" "$@" >/dev/null 2>&1 & fi
+  else
+    err "$app isn't installed — run ./setup.sh"; return 1
+  fi
+  ok "Launched $app"
+}
+pulseview_launch() { launch pulseview PulseView "$@"; }
+savvycan_launch()  { launch SavvyCAN SavvyCAN "$@"; }
+
+can_ifaces() {
+  [ "$OS" = Linux ] || return 0
+  local d; for d in /sys/class/net/*; do
+    [ "$(cat "$d/type" 2>/dev/null)" = 280 ] && basename "$d"
+  done
+}
+serial_ports() {
+  if [ "$OS" = Darwin ]; then ls /dev/cu.usbserial* /dev/cu.usbmodem* /dev/cu.wchusbserial* /dev/cu.SLAB* 2>/dev/null
+  else ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null; fi
+}
+nwords() { set -- $1; echo $#; }
+
+serial_group() { # the group that owns serial ports on this distro
+  local g; for g in dialout uucp; do getent group "$g" >/dev/null 2>&1 && { echo "$g"; return; }; done
+}
+check_groups() {
+  [ "$OS" = Linux ] || return 0
+  local g; g=$(serial_group); [ -n "$g" ] || return 0
+  if ! id -nG | grep -qw "$g"; then
+    if getent group "$g" | grep -qw "$USER"; then
+      warn "You're in '$g' but this login session isn't yet — log out/in for serial port access."
+    else
+      warn "Not in '$g' group: run  sudo usermod -aG $g $USER  then log out/in."
+    fi
+  fi
+}
+
+pick_bitrate() {
+  pick "CAN bitrate" "125 kbps" "250 kbps (trucks/J1939)" "500 kbps (most cars, OBD-II)" "1 Mbps" "Custom" || return 1
+  case $PICK_N in
+    1) BITRATE=125000 ;; 2) BITRATE=250000 ;; 3) BITRATE=500000 ;; 4) BITRATE=1000000 ;;
+    5) BITRATE=$(ask "Bitrate in bps" 500000) ;;
+  esac
+}
+pick_baud() {
+  pick "Baud rate" 9600 19200 38400 57600 115200 230400 460800 921600 1000000 Custom || return 1
+  if [ "$PICK" = Custom ]; then BAUD=$(ask "Baud" 115200); else BAUD=$PICK; fi
+}
+
+# ---------------------------------------------------------------- ISP flasher (usbisp)
+usbisp() {
+  if have usbisp; then command usbisp "$@"
+  elif [ -f "$HERE/usbisp.py" ]; then python3 "$HERE/usbisp.py" "$@"
+  else err "usbisp not found — run ./setup.sh"; return 1; fi
+}
+isp_menu() {
+  pick "AVR ISP flasher (USBHID stick 03eb:c8b4)" \
+    "Detect chip" \
+    "Write flash (.hex/.bin — erase + write + verify)" \
+    "Read flash to a backup file" \
+    "Read fuses" \
+    "Write fuses (careful!)" \
+    "Open the flasher GUI (also builds + flashes PlatformIO projects)" || return
+  local chip=() f
+  case $PICK_N in
+    2|3|4|5) local c; c=$(ask "Chip (blank = auto-detect)" "")
+             [ -n "$c" ] && chip=(-c "$c") ;;
+  esac
+  case $PICK_N in
+    1) usbisp detect ;;
+    2) f=$(ask "Firmware file" "$(ls -t ./*.hex .pio/build/*/firmware.hex 2>/dev/null | head -1)")
+       [ -f "$f" ] || { err "No such file: $f"; return; }
+       usbisp ${chip[@]+"${chip[@]}"} write "$f" ;;
+    3) f=$(ask "Save as" "$HOME/flash-backup-$(date +%Y%m%d-%H%M%S).hex")
+       usbisp ${chip[@]+"${chip[@]}"} read "$f" && ok "Saved $f" ;;
+    4) usbisp ${chip[@]+"${chip[@]}"} fuses ;;
+    5) warn "Wrong fuses can lock the chip (e.g. disabling SPI programming or picking a missing clock)."
+       info "Current values:"; usbisp ${chip[@]+"${chip[@]}"} fuses || return
+       local lo hi ex; lo=$(ask "Low fuse (hex)" ""); hi=$(ask "High fuse (hex)" ""); ex=$(ask "Extended fuse (hex)" "")
+       [ -n "$lo" ] && [ -n "$hi" ] || { err "Need at least low and high."; return; }
+       yesno "Write L=$lo H=$hi E=${ex:-unchanged}?" n && usbisp ${chip[@]+"${chip[@]}"} fuses $lo $hi $ex ;;
+    6) if have usbisp; then launch usbisp "USB ISP Flasher"
+         else (cd "$HERE" && nohup python3 usbisp.py >/dev/null 2>&1 &); ok "Launched flasher GUI"; fi ;;
+  esac
+}
+
+# ---------------------------------------------------------------- logic analyzer
+samplerate_for() { # smallest common fx2lafw rate >= $1 Hz
+  local r; for r in 1000000:1M 2000000:2M 4000000:4M 8000000:8M 12000000:12M 16000000:16M 24000000:24M; do
+    (( ${r%%:*} >= $1 )) && { echo "${r##*:}"; return; }
+  done
+  echo 24M
+}
+logic_menu() {
+  have sigrok-cli || { warn "sigrok-cli missing — only the GUI is available."; pulseview_launch; return; }
+  info "Scanning for sigrok devices…"
+  local scan; scan=$(sigrok-cli --scan 2>/dev/null | tail -n +2 | grep -v '^demo ')
+  if [ -z "$scan" ]; then
+    warn "No logic analyzer found (plug it in; on Linux replug once after install so udev rules apply)."
+    yesno "Use sigrok's built-in demo device to practice?" y || return
+    scan="demo - Demo device"
+  fi
+  echo "$scan"
+  local drv; drv=$(echo "$scan" | head -1 | cut -d' ' -f1 | cut -d: -f1)
+
+  pick "What do you want to do?" \
+    "Open PulseView (GUI, full control)" \
+    "Live UART decode in terminal" \
+    "Live I2C decode in terminal" \
+    "Live SPI decode in terminal" \
+    "Capture N seconds to a .sr file (open later in PulseView)" || return
+
+  local sr khz
+  case $PICK_N in
+    1) pulseview_launch -d "$drv" ;;
+    2) pick_baud || return
+       local rx; rx=$(ask "RX channel" D0)
+       sr=$(samplerate_for $((BAUD * 10)))
+       info "Sampling at $sr, decoding UART $BAUD 8N1 on $rx — Ctrl+C to stop"
+       sigrok-cli -d "$drv" --config samplerate="$sr" --continuous \
+         -P "uart:rx=$rx:baudrate=$BAUD" -A uart=rx-data ;;
+    3) local scl sda; scl=$(ask "SCL channel" D0); sda=$(ask "SDA channel" D1)
+       khz=$(ask "Bus speed kHz" 100); sr=$(samplerate_for $((khz * 10000)))
+       info "Sampling at $sr — Ctrl+C to stop"
+       sigrok-cli -d "$drv" --config samplerate="$sr" --continuous \
+         -P "i2c:scl=$scl:sda=$sda" -A i2c=address-read:address-write:data-read:data-write ;;
+    4) local clk mosi miso cs; clk=$(ask "CLK" D0); mosi=$(ask "MOSI" D1); miso=$(ask "MISO" D2); cs=$(ask "CS" D3)
+       khz=$(ask "SPI clock kHz" 1000); sr=$(samplerate_for $((khz * 4000)))
+       info "Sampling at $sr — Ctrl+C to stop"
+       sigrok-cli -d "$drv" --config samplerate="$sr" --continuous \
+         -P "spi:clk=$clk:mosi=$mosi:miso=$miso:cs=$cs" -A spi=mosi-data:miso-data ;;
+    5) local secs srate f; secs=$(ask "Seconds" 2); srate=$(ask "Sample rate (1M, 4M, 24M…)" 4M)
+       f="$HOME/capture-$(date +%Y%m%d-%H%M%S).sr"
+       sigrok-cli -d "$drv" --config samplerate="$srate" --time "${secs}s" -o "$f" \
+         && ok "Saved $f" && yesno "Open in PulseView?" y && pulseview_launch "$f" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- CAN
+can_up() { # can_up iface bitrate listenonly(y/n)
+  local args=(type can bitrate "$2" restart-ms 100)
+  [ "$3" = y ] && args+=(listen-only on)
+  sudo ip link set "$1" down 2>/dev/null
+  if sudo ip link set "$1" up "${args[@]}"; then
+    ok "$1 up at $2 bps$([ "$3" = y ] && echo ' (listen-only)')"
+  else
+    err "Failed to bring up $1"; return 1
+  fi
+}
+slcan_code() { # bitrate -> slcand -sN
+  case $1 in 10000) echo 0;; 20000) echo 1;; 50000) echo 2;; 100000) echo 3;; 125000) echo 4;;
+    250000) echo 5;; 500000) echo 6;; 800000) echo 7;; 1000000) echo 8;; *) echo "";; esac
+}
+after_can_up() {
+  local ifc=$1
+  pick "Next" "Open SavvyCAN (Add connection → QT SerialBus → socketcan → $ifc)" "Quick candump in this terminal" "Both" || return
+  case $PICK_N in
+    1) savvycan_launch ;;
+    2) info "candump $ifc — Ctrl+C to stop"; candump -tA -c "$ifc" ;;
+    3) savvycan_launch; info "candump $ifc — Ctrl+C to stop"; candump -tA -c "$ifc" ;;
+  esac
+}
+can_menu() {
+  local ports; ports=$(serial_ports)
+  if [ "$OS" = Darwin ]; then
+    info "macOS has no SocketCAN: use a serial-based adapter (GVRET/ESP32RET/Macchina) or a lawicel/slcan one."
+    info "In SavvyCAN: Connection → Open Connection Window → Add → Serial Connection (GVRET) → ${ports:-your /dev/cu.* port}"
+    savvycan_launch; return
+  fi
+  check_groups
+  local ifs; ifs=$(can_ifaces)
+  [ -n "$ifs" ]   && info "SocketCAN interfaces: $(echo $ifs)"
+  [ -n "$ports" ] && info "Serial ports: $(echo $ports)"
+
+  pick "CAN adapter type" \
+    "SocketCAN (candleLight CANable, PCAN, Kvaser… shows up as can0)" \
+    "slcan (CANable stock firmware, USB-serial)" \
+    "GVRET / ESP32RET / Macchina (USB-serial, configured in SavvyCAN)" \
+    "Virtual vcan0 (no hardware — practice/testing)" \
+    "Bring a CAN interface down" || return
+
+  local ifc lo port s all
+  case $PICK_N in
+    1) [ -z "$ifs" ] && { err "No CAN interface found. Plug in the adapter (check: ip -br link)."; return; }
+       if [ "$(nwords "$ifs")" -gt 1 ]; then pick "Interface" $ifs || return; ifc=$PICK; else ifc=$ifs; fi
+       pick_bitrate || return
+       lo=n; yesno "Listen-only? (safe sniffing — never ACKs or transmits)" y && lo=y
+       can_up "$ifc" "$BITRATE" "$lo" && after_can_up "$ifc" ;;
+    2) [ -z "$ports" ] && { err "No serial port found."; return; }
+       pick "Port" $ports || return; port=$PICK
+       pick_bitrate || return
+       s=$(slcan_code "$BITRATE"); [ -z "$s" ] && { err "slcan only supports standard bitrates."; return; }
+       lo=""; yesno "Listen-only?" y && lo="-l"
+       sudo pkill -f "slcand.*$port" 2>/dev/null
+       sudo slcand -o -c -s"$s" $lo "$port" slcan0 && sleep 1 && sudo ip link set slcan0 up \
+         && ok "slcan0 up at $BITRATE bps" && after_can_up slcan0 ;;
+    3) [ -z "$ports" ] && warn "No serial port seen yet — plug it in before connecting."
+       info "In SavvyCAN: Connection → Open Connection Window → Add New Device Connection"
+       info "→ Serial Connection (GVRET) → pick ${ports:-/dev/ttyACM0}, then set the bus speed in the bus table."
+       savvycan_launch ;;
+    4) if ! ip link show vcan0 >/dev/null 2>&1; then
+         sudo modprobe vcan && sudo ip link add dev vcan0 type vcan || { err "Couldn't create vcan0"; return; }
+       fi
+       sudo ip link set vcan0 up && ok "vcan0 up"
+       if yesno "Generate random test traffic (cangen) in the background?" y; then
+         setsid -f cangen vcan0 -g 10 >/dev/null 2>&1; ok "cangen running (stop: pkill cangen)"
+       fi
+       after_can_up vcan0 ;;
+    5) all=$(can_ifaces); [ -z "$all" ] && { info "No CAN interfaces."; return; }
+       pick "Interface to bring down" $all || return
+       sudo ip link set "$PICK" down && ok "$PICK down"
+       [ "$PICK" = slcan0 ] && sudo pkill slcand ;;
+  esac
+}
+
+# ---------------------------------------------------------------- serial console
+serial_menu() {
+  check_groups
+  local ports port; ports=$(serial_ports)
+  [ -z "$ports" ] && { err "No USB serial port found. Plug in the USB-UART adapter."; return; }
+  if [ "$(nwords "$ports")" -gt 1 ]; then pick "Port" $ports || return; port=$PICK; else port=$ports; info "Using $port"; fi
+  pick_baud || return
+
+  if have tio; then
+    info "tio $port @ $BAUD — quit with Ctrl+T then Q"
+    local log=(); yesno "Log to file?" n && log=(--log --log-file "$HOME/serial-$(date +%Y%m%d-%H%M%S).log")
+    tio -b "$BAUD" ${log[@]+"${log[@]}"} "$port"
+  else
+    warn "tio isn't installed (run ./setup.sh). Falling back to read-only stty+cat — Ctrl+C to stop."
+    if [ "$OS" = Darwin ]; then stty -f "$port" "$BAUD" raw -echo; else stty -F "$port" "$BAUD" raw -echo; fi && cat "$port"
+  fi
+}
+
+# ---------------------------------------------------------------- status
+status() {
+  local t i all
+  echo "${B}Tools${N}"
+  for t in usbisp pulseview sigrok-cli SavvyCAN candump slcand tio; do
+    local app=""; case $t in pulseview) app=PulseView ;; SavvyCAN) app=SavvyCAN ;; esac
+    if have "$t"; then ok "$t"
+    elif [ "$OS" = Darwin ] && [ -n "$app" ] && [ -d "/Applications/$app.app" ]; then ok "$app.app"
+    elif [ "$OS" = Darwin ] && { [ "$t" = candump ] || [ "$t" = slcand ]; }; then echo "  ${D}$t (Linux only)${N}"
+    else warn "$t missing"; fi
+  done
+  if [ "$OS" = Linux ]; then
+    echo "${B}Groups${N}"; i=$(serial_group)
+    if id -nG | grep -qw "${i:-dialout}"; then ok "${i:-dialout} active"; else check_groups; fi
+  fi
+  echo "${B}ISP stick (03eb:c8b4)${N}"
+  if [ "$OS" = Darwin ]; then system_profiler SPUSBDataType 2>/dev/null | grep -qi '0xc8b4' && ok "connected" || echo "  not connected"
+  else lsusb 2>/dev/null | grep -qi '03eb:c8b4' && ok "connected" || echo "  not connected"; fi
+  echo "${B}Logic analyzers${N}"
+  sigrok-cli --scan 2>/dev/null | tail -n +2 | grep -v '^demo ' | sed 's/^/  /' | grep . || echo "  none"
+  if [ "$OS" = Linux ]; then
+    echo "${B}CAN interfaces${N}"
+    all=$(can_ifaces); for i in $all; do echo "  $(ip -br link show "$i")"; done; [ -z "$all" ] && echo "  none"
+  fi
+  echo "${B}Serial ports${N}"; serial_ports | sed 's/^/  /' | grep . || echo "  none"
+}
+
+# ---------------------------------------------------------------- main
+case "${1:-}" in
+  -h|--help) echo "Usage: embedlab        interactive menu"; echo "       embedlab status  hardware & setup check"; exit 0 ;;
+  status) status; exit 0 ;;
+esac
+trap 'echo' INT
+while :; do
+  echo
+  echo "${B}━━ embedlab ━━${N}"
+  pick "Choose (q to quit)" \
+    "AVR ISP flasher (usbisp)" \
+    "Logic analyzer  (PulseView / sigrok decode)" \
+    "CAN bus         (SavvyCAN / candump)" \
+    "Serial console  (UART)" \
+    "Hardware & setup check" || exit 0
+  case $PICK_N in
+    1) isp_menu ;; 2) logic_menu ;; 3) can_menu ;; 4) serial_menu ;; 5) status ;;
+  esac
+done

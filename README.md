@@ -3,6 +3,15 @@
 A stand-in for ProgISP that runs on Linux, macOS and Windows. It works with the blue
 zhifengsoft "USBHID" ISP stick (USB `03eb:c8b4`) and the 94 AVR chips from ProgISP's chip list.
 
+## Full embedded bench (flasher + logic analyzer + CAN + serial)
+
+```sh
+./setup.sh      # Linux or macOS: installs usbisp, PulseView, sigrok-cli, SavvyCAN, can-utils, tio
+embedlab        # one menu for all of them; asks for bitrate / baud rate / pins
+```
+
+See **[docs/TOOLS.md](docs/TOOLS.md)** for a beginner's guide to downloading and using each tool.
+
 ## Setup
 
 ```sh

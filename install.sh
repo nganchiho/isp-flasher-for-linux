@@ -35,6 +35,7 @@ fi
 # Access to the stick without root
 if [ ! -f "$RULE" ]; then
     echo "Installing udev rule (needs sudo)…"
+    sudo mkdir -p "$(dirname "$RULE")"
     sudo tee "$RULE" >/dev/null <<'RULES'
 SUBSYSTEM=="usb", ATTR{idVendor}=="03eb", ATTR{idProduct}=="c8b4", MODE="0666"
 KERNEL=="hidraw*", ATTRS{idVendor}=="03eb", ATTRS{idProduct}=="c8b4", MODE="0666"
